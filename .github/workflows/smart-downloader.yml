@@ -1,4 +1,4 @@
-name: '📦 حرفه‌ای: دانلود و ذخیره در مخزن'
+name: '📦 حرفه‌ای: دانلود و ذخیره (نسخه بهینه)'
 
 on:
   workflow_dispatch:
@@ -10,12 +10,10 @@ on:
       password:
         description: '🔐 رمز فایل فشرده (اختیاری)'
         required: false
-        type: string
         default: ''
       split_size:
-        description: '📦 حجم هر تکه (پیش‌فرض: 95m) مثال: 95m, 100m, 200m'
+        description: '📦 حجم هر تکه'
         required: false
-        type: string
         default: '95m'
 
 permissions:
@@ -24,139 +22,103 @@ permissions:
 jobs:
   download-and-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     steps:
-      - name: 🔄 دریافت کد مخزن
+      - name: 🔄 Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: ⚙️ نصب ابزارها
+      - name: ⚙️ Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full file git-lfs
+          sudo apt-get install -y aria2 p7zip-full file
 
-      - name: 📥 دانلود فایل
-        id: download
+      # 🚀 Faster + resumable download
+      - name: 📥 Download (aria2)
         run: |
           URL="${{ github.event.inputs.file_url }}"
-          echo "در حال دانلود از: $URL"
-          curl -L --fail --retry 5 --retry-delay 5 --progress-bar -o downloaded_file "$URL"
-          if [ $? -ne 0 ]; then exit 1; fi
+          echo "Downloading: $URL"
+
+          aria2c \
+            -x 16 -s 16 \
+            -k 1M \
+            --continue=true \
+            --retry-wait=5 \
+            --max-tries=10 \
+            --summary-interval=10 \
+            -o downloaded_file \
+            "$URL"
+
+          if [ ! -f downloaded_file ]; then
+            echo "❌ Download failed"
+            exit 1
+          fi
+
           ls -lh downloaded_file
 
-      - name: 🧠 تشخیص نوع و استخراج نام اصلی
-        id: classify
+      # 🧠 Smart classification
+      - name: 🧠 Detect type
         run: |
           RAW_NAME=$(basename "${{ github.event.inputs.file_url }}" | sed 's/\?.*//' | sed 's/%20/ /g')
-          if [ -z "$RAW_NAME" ]; then RAW_NAME="unknown_file"; fi
+          [ -z "$RAW_NAME" ] && RAW_NAME="unknown_file"
+
           SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[\\/:*?"<>|]/_/g')
+
           MIME=$(file -b --mime-type downloaded_file)
           EXT="${RAW_NAME##*.}"
           EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
-          
-          if [[ "$MIME" == video/* ]] || [[ "$EXT" =~ ^(mp4|mkv|avi|mov|wmv|flv|webm)$ ]]; then
-            CAT="video"
-          elif [[ "$MIME" == audio/* ]] || [[ "$EXT" =~ ^(mp3|wav|ogg|flac|m4a)$ ]]; then
-            CAT="audio"
-          elif [[ "$MIME" == image/* ]] || [[ "$EXT" =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then
-            CAT="image"
-          elif [[ "$MIME" == application/pdf ]] || [[ "$EXT" =~ ^(pdf|doc|docx|xls|xlsx|ppt|pptx|txt)$ ]]; then
-            CAT="document"
-          else
-            CAT="other"
+
+          if [[ "$MIME" == video/* ]]; then CAT="video"
+          elif [[ "$MIME" == audio/* ]]; then CAT="audio"
+          elif [[ "$MIME" == image/* ]]; then CAT="image"
+          elif [[ "$MIME" == application/pdf ]]; then CAT="document"
+          else CAT="other"
           fi
-          
+
           echo "CAT=$CAT" >> $GITHUB_ENV
           echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
-          echo "✅ دسته: $CAT → زیرپوشه: $SAFE_NAME"
 
-      - name: 🗜️ فشرده‌سازی و تقسیم
+      # ⚡ Smart compression (skip if already compressed)
+      - name: 🗜️ Compress & Split
         run: |
           FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
           mkdir -p "$FINAL_DIR"
-          rm -f "$FINAL_DIR"/*.7z*
-          
-          if [ -z "${{ github.event.inputs.password }}" ]; then
-            7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./downloaded_file"
-          else
-            7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./downloaded_file"
-          fi
-          
-          echo "✅ فایل در $FINAL_DIR ذخیره شد"
-          ls -lh "$FINAL_DIR"
-          
-          # Count total parts for progress tracking
-          TOTAL_PARTS=$(ls "$FINAL_DIR"/archive.7z.* 2>/dev/null | wc -l)
-          echo "TOTAL_PARTS=$TOTAL_PARTS" >> $GITHUB_ENV
-          echo "Total parts created: $TOTAL_PARTS"
 
-      - name: 🚀 پوش تکه‌ای (Incremental Push)
+          FILE_TYPE=$(file downloaded_file)
+
+          # If already archive, skip recompression
+          if echo "$FILE_TYPE" | grep -Eiq 'zip|rar|7z'; then
+            echo "⚡ Already compressed → just splitting"
+
+            split -b ${{ github.event.inputs.split_size }} downloaded_file "$FINAL_DIR/part_"
+          else
+            echo "⚡ Compressing..."
+
+            if [ -z "${{ github.event.inputs.password }}" ]; then
+              7z a -mx=1 -mmt=on -v${{ github.event.inputs.split_size }} \
+                "$FINAL_DIR/archive.7z" downloaded_file
+            else
+              7z a -p"${{ github.event.inputs.password }}" -mx=1 -mmt=on \
+                -v${{ github.event.inputs.split_size }} \
+                "$FINAL_DIR/archive.7z" downloaded_file
+            fi
+          fi
+
+          ls -lh "$FINAL_DIR"
+
+      # 🧹 Reduce repo size growth
+      - name: 🧹 Clean temp
+        run: rm -f downloaded_file
+
+      - name: 📝 Commit & Push
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
-          
-          # Get all part files
-          PARTS=($(ls "$FINAL_DIR"/archive.7z.* | sort))
-          TOTAL=${#PARTS[@]}
-          
-          echo "Pushing $TOTAL parts incrementally..."
-          
-          # Push each part separately
-          for i in "${!PARTS[@]}"; do
-            PART_NUM=$((i+1))
-            echo "📤 Pushing part $PART_NUM of $TOTAL: ${PARTS[$i]}"
-            
-            # Add and commit only this part
-            git add "${PARTS[$i]}"
-            git commit -m "📦 ${{ env.SAFE_NAME }} - Part $PART_NUM/$TOTAL" || echo "No changes to commit"
-            
-            # Push with retry logic
-            RETRIES=3
-            while [ $RETRIES -gt 0 ]; do
-              if git push origin HEAD:${{ github.ref_name }}; then
-                echo "✅ Part $PART_NUM pushed successfully"
-                break
-              else
-                RETRIES=$((RETRIES-1))
-                if [ $RETRIES -gt 0 ]; then
-                  echo "⚠️ Push failed, retrying in 10 seconds... ($RETRIES attempts left)"
-                  sleep 10
-                  git pull --rebase origin ${{ github.ref_name }} || true
-                else
-                  echo "❌ Failed to push part $PART_NUM after multiple attempts"
-                  exit 1
-                fi
-              fi
-            done
-            
-            # Small delay between pushes
-            sleep 2
-          done
-          
-          echo "🎉 All parts pushed successfully!"
+          git config user.email "actions@github.com"
 
-      - name: 📝 کامیت نهایی metadata
-        if: success()
-        run: |
-          FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
-          
-          # Create metadata file
-          TOTAL_PARTS=$(ls "$FINAL_DIR"/archive.7z.* 2>/dev/null | wc -l)
-          cat > "$FINAL_DIR/metadata.txt" << EOF
-          Original Name: ${{ env.SAFE_NAME }}
-          Category: ${{ env.CAT }}
-          Split Size: ${{ github.event.inputs.split_size }}
-          Total Parts: $TOTAL_PARTS
-          Download Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          Password Protected: ${{ github.event.inputs.password != '' && 'Yes' || 'No' }}
-          EOF
-          
-          git add "$FINAL_DIR/metadata.txt"
-          git commit -m "📋 Add metadata for ${{ env.SAFE_NAME }}" || echo "No changes"
-          
-          git push origin HEAD:${{ github.ref_name }} || {
-            echo "⚠️ Metadata push failed, but parts are already uploaded"
-            exit 0
-          }
+          git add downloads/
+
+          git commit -m "📦 ${{ env.SAFE_NAME }} [${{ env.CAT }}]" || echo "No changes"
+
+          git push
