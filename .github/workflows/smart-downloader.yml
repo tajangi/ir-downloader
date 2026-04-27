@@ -27,11 +27,13 @@ jobs:
     steps:
       - name: 🔄 دریافت کد مخزن
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: ⚙️ نصب ابزارها
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full file
+          sudo apt-get install -y p7zip-full file git-lfs
 
       - name: 📥 دانلود فایل
         id: download
@@ -68,11 +70,10 @@ jobs:
           echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
           echo "✅ دسته: $CAT → زیرپوشه: $SAFE_NAME"
 
-      - name: 🗜️ فشرده‌سازی و تقسیم (با اعمال رمز)
+      - name: 🗜️ فشرده‌سازی و تقسیم
         run: |
           FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
           mkdir -p "$FINAL_DIR"
-          
           rm -f "$FINAL_DIR"/*.7z*
           
           if [ -z "${{ github.event.inputs.password }}" ]; then
@@ -83,105 +84,79 @@ jobs:
           
           echo "✅ فایل در $FINAL_DIR ذخیره شد"
           ls -lh "$FINAL_DIR"
+          
+          # Count total parts for progress tracking
+          TOTAL_PARTS=$(ls "$FINAL_DIR"/archive.7z.* 2>/dev/null | wc -l)
+          echo "TOTAL_PARTS=$TOTAL_PARTS" >> $GITHUB_ENV
+          echo "Total parts created: $TOTAL_PARTS"
 
-      - name: 📝 کامیت اولیه (بدون پوش)
+      - name: 🚀 پوش تکه‌ای (Incremental Push)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global http.postBuffer 524288000
-          git add downloads/
-          git commit -m "Add downloaded file: ${{ env.SAFE_NAME }} (category: ${{ env.CAT }})" || echo "Nothing to commit"
-
-      - name: 🚀 پوش تکه‌تکه (برای جلوگیری از خطای hung up)
-        run: |
-          # دریافت تعداد کل کامیت‌هایی که باید پوش شوند
-          TOTAL_COMMITS=$(git rev-list --count origin/main..HEAD 2>/dev/null || git rev-list --count HEAD)
           
-          if [ "$TOTAL_COMMITS" -eq 0 ]; then
-            echo "هیچ کامیت جدیدی برای پوش وجود ندارد"
-            exit 0
-          fi
+          FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
           
-          # پوش کردن تکه‌تکه (هر بار ۵۰ کامیت)
-          # برای فایل‌های حجیم، یک کامیت داریم ولی حاوی فایل‌های زیاد است
-          # استراتژی بهتر: ابتدا بدون فایل‌های حجیم پوش کنیم، سپس با git lfs
+          # Get all part files
+          PARTS=($(ls "$FINAL_DIR"/archive.7z.* | sort))
+          TOTAL=${#PARTS[@]}
           
-          echo "🔍 بررسی حجم فایل‌های جدید..."
+          echo "Pushing $TOTAL parts incrementally..."
           
-          # پیدا کردن فایل‌های بزرگتر از 100MB
-          LARGE_FILES=$(git diff --cached --name-only | xargs -I {} sh -c 'test -f "{}" && find "{}" -size +100M 2>/dev/null' || true)
-          
-          if [ -n "$LARGE_FILES" ]; then
-            echo "⚠️ فایل‌های بزرگ شناسایی شدند:"
-            echo "$LARGE_FILES"
+          # Push each part separately
+          for i in "${!PARTS[@]}"; do
+            PART_NUM=$((i+1))
+            echo "📤 Pushing part $PART_NUM of $TOTAL: ${PARTS[$i]}"
             
-            # روش اول: پوش با Git LFS
-            echo "🔄 تلاش برای پوش با Git LFS..."
-            git lfs install
-            git lfs track "*.7z*"
-            git add .gitattributes
-            git commit -m "Add LFS tracking for 7z files" --amend --no-edit 2>/dev/null || true
+            # Add and commit only this part
+            git add "${PARTS[$i]}"
+            git commit -m "📦 ${{ env.SAFE_NAME }} - Part $PART_NUM/$TOTAL" || echo "No changes to commit"
             
-            # پوش با LFS
-            if git push origin HEAD:main --force-with-lease; then
-              echo "✅ پوش با LFS موفقیت‌آمیز بود"
-              exit 0
-            fi
-          fi
-          
-          # روش دوم: پوش تکه‌تکه با retry
-          echo "🔄 پوش تکه‌تکه (هر تکه: فایل‌های 7z)"
-          
-          # دریافت لیست فایل‌های 7z جدید
-          7Z_FILES=$(git diff --cached --name-only --diff-filter=A | grep "\.7z\.[0-9]\+$" || true)
-          
-          if [ -n "$7Z_FILES" ]; then
-            # حذف موقت فایل‌های 7z از staging
-            git reset HEAD -- $7Z_FILES 2>/dev/null || true
-            
-            # کامیت اول: فقط متادیتا
-            git commit -m "Add metadata for ${{ env.SAFE_NAME }}" --amend --no-edit 2>/dev/null || \
-            git commit -m "Add metadata for ${{ env.SAFE_NAME }}"
-            
-            # پوش متادیتا
-            git push origin HEAD:main --force-with-lease || git push origin HEAD:main
-            
-            # اضافه کردن هر فایل 7z به صورت جداگانه و پوش
-            for file in $7Z_FILES; do
-              echo "📤 پوش فایل: $file"
-              git add "$file"
-              git commit -m "Add part: $(basename $file)"
-              
-              # پوش با ریتری
-              for i in {1..3}; do
-                if git push origin HEAD:main; then
-                  echo "✅ پوش $file موفقیت‌آمیز"
-                  break
-                else
-                  echo "⚠️ تلاش $i ناموفق، صبر می‌کنم..."
-                  sleep 10
-                  if [ $i -eq 3 ]; then
-                    echo "❌ خطا در پوش $file"
-                    exit 1
-                  fi
-                fi
-              done
-            done
-          else
-            # روش سوم: پوش عادی با buffer بزرگ
-            echo "🔄 پوش عادی..."
-            git config --global http.postBuffer 524288000
-            git config --global http.lowSpeedLimit 0
-            git config --global http.lowSpeedTime 999999
-            
-            for i in {1..5}; do
-              if git push origin HEAD:main; then
-                echo "✅ پوش موفقیت‌آمیز"
-                exit 0
+            # Push with retry logic
+            RETRIES=3
+            while [ $RETRIES -gt 0 ]; do
+              if git push origin HEAD:${{ github.ref_name }}; then
+                echo "✅ Part $PART_NUM pushed successfully"
+                break
               else
-                echo "⚠️ تلاش $i از ۵ ناموفق، ۳۰ ثانیه صبر..."
-                sleep 30
+                RETRIES=$((RETRIES-1))
+                if [ $RETRIES -gt 0 ]; then
+                  echo "⚠️ Push failed, retrying in 10 seconds... ($RETRIES attempts left)"
+                  sleep 10
+                  git pull --rebase origin ${{ github.ref_name }} || true
+                else
+                  echo "❌ Failed to push part $PART_NUM after multiple attempts"
+                  exit 1
+                fi
               fi
             done
-            exit 1
-          fi
+            
+            # Small delay between pushes
+            sleep 2
+          done
+          
+          echo "🎉 All parts pushed successfully!"
+
+      - name: 📝 کامیت نهایی metadata
+        if: success()
+        run: |
+          FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
+          
+          # Create metadata file
+          TOTAL_PARTS=$(ls "$FINAL_DIR"/archive.7z.* 2>/dev/null | wc -l)
+          cat > "$FINAL_DIR/metadata.txt" << EOF
+          Original Name: ${{ env.SAFE_NAME }}
+          Category: ${{ env.CAT }}
+          Split Size: ${{ github.event.inputs.split_size }}
+          Total Parts: $TOTAL_PARTS
+          Download Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Password Protected: ${{ github.event.inputs.password != '' && 'Yes' || 'No' }}
+          EOF
+          
+          git add "$FINAL_DIR/metadata.txt"
+          git commit -m "📋 Add metadata for ${{ env.SAFE_NAME }}" || echo "No changes"
+          
+          git push origin HEAD:${{ github.ref_name }} || {
+            echo "⚠️ Metadata push failed, but parts are already uploaded"
+            exit 0
+          }
