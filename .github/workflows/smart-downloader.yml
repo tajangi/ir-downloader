@@ -94,6 +94,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global http.postBuffer 524288000
           git add downloads/
           git commit -m "Add downloaded file: ${{ env.SAFE_NAME }} (category: ${{ env.CAT }})" || echo "Nothing to commit"
           git push
