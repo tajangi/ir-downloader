@@ -19,7 +19,7 @@ on:
         default: '95m'
 
 permissions:
-  contents: write  # مهم: اجازه پوش به مخزن
+  contents: write
 
 jobs:
   download-and-commit:
@@ -45,12 +45,9 @@ jobs:
       - name: 🧠 تشخیص نوع و استخراج نام اصلی
         id: classify
         run: |
-          # نام اصلی از لینک
           RAW_NAME=$(basename "${{ github.event.inputs.file_url }}" | sed 's/\?.*//' | sed 's/%20/ /g')
           if [ -z "$RAW_NAME" ]; then RAW_NAME="unknown_file"; fi
-          # حذف کاراکترهای غیرمجاز برای نام پوشه (جایگزینی با _)
           SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[\\/:*?"<>|]/_/g')
-          # تشخیص MIME
           MIME=$(file -b --mime-type downloaded_file)
           EXT="${RAW_NAME##*.}"
           EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
@@ -73,14 +70,11 @@ jobs:
 
       - name: 🗜️ فشرده‌سازی و تقسیم (با اعمال رمز)
         run: |
-          # پوشه نهایی: downloads/دسته/نام فایل/
           FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
           mkdir -p "$FINAL_DIR"
           
-          # حذف فایل‌های قبلی در آن زیرپوشه (در صورت وجود) تا تداخل پیش نیاید
           rm -f "$FINAL_DIR"/*.7z*
           
-          # فشرده‌سازی
           if [ -z "${{ github.event.inputs.password }}" ]; then
             7z a -mhe=on -mx=3 -v${{ github.event.inputs.split_size }} "$FINAL_DIR/archive.7z" "./downloaded_file"
           else
@@ -90,11 +84,104 @@ jobs:
           echo "✅ فایل در $FINAL_DIR ذخیره شد"
           ls -lh "$FINAL_DIR"
 
-      - name: 📝 کامیت و پوش به مخزن
+      - name: 📝 کامیت اولیه (بدون پوش)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config --global http.postBuffer 524288000
           git add downloads/
           git commit -m "Add downloaded file: ${{ env.SAFE_NAME }} (category: ${{ env.CAT }})" || echo "Nothing to commit"
-          git push
+
+      - name: 🚀 پوش تکه‌تکه (برای جلوگیری از خطای hung up)
+        run: |
+          # دریافت تعداد کل کامیت‌هایی که باید پوش شوند
+          TOTAL_COMMITS=$(git rev-list --count origin/main..HEAD 2>/dev/null || git rev-list --count HEAD)
+          
+          if [ "$TOTAL_COMMITS" -eq 0 ]; then
+            echo "هیچ کامیت جدیدی برای پوش وجود ندارد"
+            exit 0
+          fi
+          
+          # پوش کردن تکه‌تکه (هر بار ۵۰ کامیت)
+          # برای فایل‌های حجیم، یک کامیت داریم ولی حاوی فایل‌های زیاد است
+          # استراتژی بهتر: ابتدا بدون فایل‌های حجیم پوش کنیم، سپس با git lfs
+          
+          echo "🔍 بررسی حجم فایل‌های جدید..."
+          
+          # پیدا کردن فایل‌های بزرگتر از 100MB
+          LARGE_FILES=$(git diff --cached --name-only | xargs -I {} sh -c 'test -f "{}" && find "{}" -size +100M 2>/dev/null' || true)
+          
+          if [ -n "$LARGE_FILES" ]; then
+            echo "⚠️ فایل‌های بزرگ شناسایی شدند:"
+            echo "$LARGE_FILES"
+            
+            # روش اول: پوش با Git LFS
+            echo "🔄 تلاش برای پوش با Git LFS..."
+            git lfs install
+            git lfs track "*.7z*"
+            git add .gitattributes
+            git commit -m "Add LFS tracking for 7z files" --amend --no-edit 2>/dev/null || true
+            
+            # پوش با LFS
+            if git push origin HEAD:main --force-with-lease; then
+              echo "✅ پوش با LFS موفقیت‌آمیز بود"
+              exit 0
+            fi
+          fi
+          
+          # روش دوم: پوش تکه‌تکه با retry
+          echo "🔄 پوش تکه‌تکه (هر تکه: فایل‌های 7z)"
+          
+          # دریافت لیست فایل‌های 7z جدید
+          7Z_FILES=$(git diff --cached --name-only --diff-filter=A | grep "\.7z\.[0-9]\+$" || true)
+          
+          if [ -n "$7Z_FILES" ]; then
+            # حذف موقت فایل‌های 7z از staging
+            git reset HEAD -- $7Z_FILES 2>/dev/null || true
+            
+            # کامیت اول: فقط متادیتا
+            git commit -m "Add metadata for ${{ env.SAFE_NAME }}" --amend --no-edit 2>/dev/null || \
+            git commit -m "Add metadata for ${{ env.SAFE_NAME }}"
+            
+            # پوش متادیتا
+            git push origin HEAD:main --force-with-lease || git push origin HEAD:main
+            
+            # اضافه کردن هر فایل 7z به صورت جداگانه و پوش
+            for file in $7Z_FILES; do
+              echo "📤 پوش فایل: $file"
+              git add "$file"
+              git commit -m "Add part: $(basename $file)"
+              
+              # پوش با ریتری
+              for i in {1..3}; do
+                if git push origin HEAD:main; then
+                  echo "✅ پوش $file موفقیت‌آمیز"
+                  break
+                else
+                  echo "⚠️ تلاش $i ناموفق، صبر می‌کنم..."
+                  sleep 10
+                  if [ $i -eq 3 ]; then
+                    echo "❌ خطا در پوش $file"
+                    exit 1
+                  fi
+                fi
+              done
+            done
+          else
+            # روش سوم: پوش عادی با buffer بزرگ
+            echo "🔄 پوش عادی..."
+            git config --global http.postBuffer 524288000
+            git config --global http.lowSpeedLimit 0
+            git config --global http.lowSpeedTime 999999
+            
+            for i in {1..5}; do
+              if git push origin HEAD:main; then
+                echo "✅ پوش موفقیت‌آمیز"
+                exit 0
+              else
+                echo "⚠️ تلاش $i از ۵ ناموفق، ۳۰ ثانیه صبر..."
+                sleep 30
+              fi
+            done
+            exit 1
+          fi
