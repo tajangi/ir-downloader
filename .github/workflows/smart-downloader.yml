@@ -1,4 +1,4 @@
-name: '📦 حرفه‌ای: دانلود و ذخیره (نسخه بهینه)'
+name: '📦 دانلود و آپلود امن (نسخه پایدار)'
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       password:
-        description: '🔐 رمز فایل فشرده (اختیاری)'
+        description: '🔐 رمز (اختیاری)'
         required: false
         default: ''
       split_size:
@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 jobs:
-  download-and-commit:
+  upload:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -35,8 +35,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y aria2 p7zip-full file
 
-      # 🚀 Faster + resumable download
-      - name: 📥 Download (aria2)
+      # 🚀 FAST + RESUMABLE DOWNLOAD
+      - name: 📥 Download with aria2
         run: |
           URL="${{ github.event.inputs.file_url }}"
           echo "Downloading: $URL"
@@ -45,21 +45,17 @@ jobs:
             -x 16 -s 16 \
             -k 1M \
             --continue=true \
-            --retry-wait=5 \
             --max-tries=10 \
-            --summary-interval=10 \
+            --retry-wait=5 \
             -o downloaded_file \
             "$URL"
 
-          if [ ! -f downloaded_file ]; then
-            echo "❌ Download failed"
-            exit 1
-          fi
+          [ ! -f downloaded_file ] && echo "Download failed" && exit 1
 
           ls -lh downloaded_file
 
-      # 🧠 Smart classification
-      - name: 🧠 Detect type
+      # 🧠 Detect name/type
+      - name: 🧠 Detect file info
         run: |
           RAW_NAME=$(basename "${{ github.event.inputs.file_url }}" | sed 's/\?.*//' | sed 's/%20/ /g')
           [ -z "$RAW_NAME" ] && RAW_NAME="unknown_file"
@@ -67,8 +63,6 @@ jobs:
           SAFE_NAME=$(echo "$RAW_NAME" | sed 's/[\\/:*?"<>|]/_/g')
 
           MIME=$(file -b --mime-type downloaded_file)
-          EXT="${RAW_NAME##*.}"
-          EXT=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
 
           if [[ "$MIME" == video/* ]]; then CAT="video"
           elif [[ "$MIME" == audio/* ]]; then CAT="audio"
@@ -77,24 +71,23 @@ jobs:
           else CAT="other"
           fi
 
-          echo "CAT=$CAT" >> $GITHUB_ENV
           echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          echo "CAT=$CAT" >> $GITHUB_ENV
 
-      # ⚡ Smart compression (skip if already compressed)
-      - name: 🗜️ Compress & Split
+      # ⚡ SPLIT (SMART)
+      - name: 🧩 Split / Compress
         run: |
           FINAL_DIR="downloads/${{ env.CAT }}/${{ env.SAFE_NAME }}"
           mkdir -p "$FINAL_DIR"
 
-          FILE_TYPE=$(file downloaded_file)
+          FILE_INFO=$(file downloaded_file)
 
-          # If already archive, skip recompression
-          if echo "$FILE_TYPE" | grep -Eiq 'zip|rar|7z'; then
-            echo "⚡ Already compressed → just splitting"
-
+          # If ISO or already compressed → don't compress
+          if echo "$FILE_INFO" | grep -Eiq 'ISO|archive|compressed|zip|rar|7z'; then
+            echo "⚡ Skipping compression, splitting only"
             split -b ${{ github.event.inputs.split_size }} downloaded_file "$FINAL_DIR/part_"
           else
-            echo "⚡ Compressing..."
+            echo "⚡ Compressing"
 
             if [ -z "${{ github.event.inputs.password }}" ]; then
               7z a -mx=1 -mmt=on -v${{ github.event.inputs.split_size }} \
@@ -108,17 +101,40 @@ jobs:
 
           ls -lh "$FINAL_DIR"
 
-      # 🧹 Reduce repo size growth
-      - name: 🧹 Clean temp
+      - name: 🧹 Cleanup temp
         run: rm -f downloaded_file
 
-      - name: 📝 Commit & Push
+      # 🔥 CRITICAL FIX: CHUNKED PUSH
+      - name: 📤 Chunked Commit & Push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "actions@github.com"
 
-          git add downloads/
+          git config --global http.postBuffer 524288000
 
-          git commit -m "📦 ${{ env.SAFE_NAME }} [${{ env.CAT }}]" || echo "No changes"
+          cd downloads
 
-          git push
+          COUNT=0
+          LIMIT=5
+
+          for file in $(find . -type f | sort); do
+            git add "$file"
+            COUNT=$((COUNT+1))
+
+            if [ $COUNT -ge $LIMIT ]; then
+              git commit -m "📦 partial upload"
+              
+              for i in 1 2 3; do
+                git push && break || sleep 10
+              done
+
+              COUNT=0
+            fi
+          done
+
+          # Final commit
+          git commit -m "📦 final upload" || echo "Nothing to commit"
+
+          for i in 1 2 3; do
+            git push && break || sleep 10
+          done
