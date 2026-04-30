@@ -1,0 +1,76 @@
+name: Download latest Morad Vaisi stream (480p, split)
+
+on:
+  workflow_dispatch:   # فقط دستی
+
+permissions:
+  contents: write
+
+jobs:
+  download-split-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: Download latest streamed video (480p)
+        env:
+          # کانال ثابت – می‌توانید در صورت نیاز آن را تغییر دهید
+          YT_CHANNEL_URL: "https://www.youtube.com/@MoradVaisi"
+        run: |
+          mkdir -p videos
+          touch downloaded.txt
+
+          # دریافت آخرین ویدیوی کانال
+          # برای گرفتن فقط آخرین لایو (ویدیوهایی که قبلاً live بوده‌اند) این قسمت را فعال کنید:
+          # yt-dlp --match-filter "was_live" ...
+          yt-dlp \
+            --download-archive downloaded.txt \
+            --match-filter "was_live" \
+            --playlist-end 1 \
+            -f "bestvideo[height<=480]+bestaudio/best[height<=480]" \
+            --merge-output-format mp4 \
+            -o "videos/%(title)s.%(ext)s" \
+            "$YT_CHANNEL_URL"
+            
+
+      - name: Check if new video downloaded and split it
+        id: split
+        run: |
+          NEW_VIDEO=$(find videos -name "*.mp4" -newer downloaded.txt -print -quit)
+          if [ -z "$NEW_VIDEO" ]; then
+            echo "no_new_video=true" >> $GITHUB_OUTPUT
+            echo "No new video file found."
+            exit 0
+          fi
+
+          echo "no_new_video=false" >> $GITHUB_OUTPUT
+          echo "New video: $NEW_VIDEO"
+
+          BASENAME=$(basename "$NEW_VIDEO" .mp4)
+          echo "basename=$BASENAME" >> $GITHUB_OUTPUT
+
+          # تکه‌های 90 مگابایتی (زیر محدودیت 100MB گیتهاب)
+          PREFIX="videos/${BASENAME}.part-"
+          split -d -b 90M "$NEW_VIDEO" "${PREFIX}"
+          echo "split_prefix=${PREFIX}" >> $GITHUB_OUTPUT
+
+          # حذف فایل کامل ویدیو
+          rm -f "$NEW_VIDEO"
+
+      - name: Commit and push chunks and archive
+        if: steps.split.outputs.no_new_video != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add videos/ downloaded.txt
+          git commit -m "Add latest Morad Vaisi video chunks: ${{ steps.split.outputs.basename }} - $(date +'%Y-%m-%d')"
+          git push
